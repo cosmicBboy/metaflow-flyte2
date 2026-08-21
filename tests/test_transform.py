@@ -15,6 +15,7 @@ from metaflow_flyte2._naming import sanitize
 from metaflow_flyte2._transform import (
     apply_renames,
     fix_condition_branch,
+    inject_datastore_resolution,
     inject_prelude,
     inject_task_defaults,
     plan_renames,
@@ -220,6 +221,89 @@ class TestTaskDefaults:
         assert inject_task_defaults(GENERATED, {}) == GENERATED
 
 
+class TestDatastoreResolution:
+    """The in-task fallback that points Metaflow at Flyte's own object store."""
+
+    RUN_CMD = textwrap.dedent(
+        """\
+        def _run_cmd(cmd, extra_env=None):
+            env = os.environ.copy()
+            env.setdefault('METAFLOW_DATASTORE_SYSROOT_LOCAL', os.path.expanduser('~'))
+            return env
+        """
+    )
+
+    def _module(self, datastore_type, raw_path, env=None):
+        """Exec the prelude + patched _run_cmd with a stubbed flyte context."""
+        import os
+        import types
+
+        source = inject_datastore_resolution(inject_prelude("import os\n")) + self.RUN_CMD
+        source = inject_datastore_resolution(source)
+
+        ctx = types.SimpleNamespace(raw_data_path=types.SimpleNamespace(path=raw_path))
+        fake_flyte = types.ModuleType("flyte")
+        fake_flyte.ctx = lambda: ctx
+
+        namespace: dict = {"DATASTORE_TYPE": datastore_type, "os": os}
+        exec(compile(source, "<gen>", "exec"), namespace)
+
+        import sys
+
+        real = sys.modules.get("flyte")
+        sys.modules["flyte"] = fake_flyte
+        try:
+            environ = dict(env or {})
+            namespace["_mf2_ensure_datastore_root"](environ)
+            return environ
+        finally:
+            if real is not None:
+                sys.modules["flyte"] = real
+            else:
+                sys.modules.pop("flyte", None)
+
+    def test_derives_bucket_from_the_raw_data_path(self):
+        env = self._module(
+            "s3",
+            "s3://tenant-raw/56/org/proj/development/urun/a0/urun-a0-0",
+            {"FLYTE_INTERNAL_PROJECT": "proj", "FLYTE_INTERNAL_DOMAIN": "development"},
+        )
+        # Only the bucket is taken: the rest of the raw path is per-action, and a
+        # per-action root would leave each step unable to read the previous one.
+        assert env["METAFLOW_DATASTORE_SYSROOT_S3"] == (
+            "s3://tenant-raw/metaflow-datastore/proj/development"
+        )
+
+    def test_is_stable_across_actions_in_a_run(self):
+        base = "s3://tenant-raw/56/org/proj/development/urun"
+        first = self._module("s3", f"{base}/a0/urun-a0-0")
+        second = self._module("s3", f"{base}/a7/urun-a7-0")
+        assert first["METAFLOW_DATASTORE_SYSROOT_S3"] == second["METAFLOW_DATASTORE_SYSROOT_S3"]
+
+    def test_an_explicit_root_is_never_overwritten(self):
+        env = self._module("s3", "s3://tenant-raw/x/y", {"METAFLOW_DATASTORE_SYSROOT_S3": "s3://mine/p"})
+        assert env["METAFLOW_DATASTORE_SYSROOT_S3"] == "s3://mine/p"
+
+    def test_local_datastore_is_left_alone(self):
+        assert self._module("local", "s3://tenant-raw/x/y") == {}
+
+    def test_local_raw_path_derives_nothing(self):
+        """Running locally, there is no shared object store to point at."""
+        assert self._module("s3", "/tmp/flyte/raw_data/abc") == {}
+
+    def test_other_backends_use_their_own_variable(self):
+        env = self._module("gs", "gs://tenant-raw/x/y")
+        assert env["METAFLOW_DATASTORE_SYSROOT_GS"].startswith("gs://tenant-raw/metaflow-datastore/")
+
+    def test_injection_is_idempotent(self):
+        once = inject_datastore_resolution(self.RUN_CMD)
+        assert inject_datastore_resolution(once) == once
+        assert once.count("_mf2_ensure_datastore_root(env)") == 1
+
+    def test_noop_when_run_cmd_no_longer_matches(self):
+        assert inject_datastore_resolution("def _run_cmd(cmd): pass\n") == "def _run_cmd(cmd): pass\n"
+
+
 class TestConditionBranch:
     SOURCE = textwrap.dedent(
         """\
@@ -258,6 +342,31 @@ class TestTransform:
         assert "def step_start" in out
         assert "_Mf2MainThreadOnlySignal" in out
         assert "_MF2_ENVIRONMENT" in out
+
+    def test_datastore_resolution_reaches_run_cmd(self):
+        """Regression: the prelude defines the helper, _run_cmd must *call* it.
+
+        A substring guard on the bare call also matched the prelude's ``def``
+        line, so the call site was silently never inserted and remote runs failed
+        with "Could not find the location of the datastore". Only the full
+        pipeline, in order, exposes this.
+        """
+        source = GENERATED.replace(
+            "def _run_cmd(cmd):",
+            "def _run_cmd(cmd):\n    env = os.environ.copy()\n"
+            "    env.setdefault('METAFLOW_DATASTORE_SYSROOT_LOCAL', os.path.expanduser('~'))",
+        )
+        out = transform(source, {"A": "b"}, memory="1Gi")
+        assert "def _mf2_ensure_datastore_root(env):" in out
+        assert "    _mf2_ensure_datastore_root(env)  # injected by metaflow_flyte2" in out
+        ast.parse(out)
+
+    def test_full_transform_is_idempotent(self):
+        once = transform(GENERATED, {"A": "b"}, memory="1Gi")
+        twice = transform(once, {"A": "b"}, memory="1Gi")
+        assert twice.count("_mf2_ensure_datastore_root(env)  # injected") == once.count(
+            "_mf2_ensure_datastore_root(env)  # injected"
+        )
 
     def test_unchanged_source_gets_no_banner(self):
         already = transform(GENERATED, {"A": "b"}, memory="1Gi")

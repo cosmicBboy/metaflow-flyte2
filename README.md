@@ -3,7 +3,7 @@
 Run **Metaflow** flows on **Flyte 2** — without changing a line of your flow.
 
 ```bash
-pyflyte-metaflow run --remote --datastore-root s3://my-bucket/metaflow my_flow.py
+pyflyte-metaflow run --remote my_flow.py
 ```
 
 ## What this is
@@ -51,21 +51,21 @@ import line at all.
 pyflyte-metaflow run my_flow.py
 
 # Run on the cluster
-pyflyte-metaflow run --remote --datastore-root s3://my-bucket/metaflow my_flow.py
+pyflyte-metaflow run --remote my_flow.py
 
 # Metaflow Parameters go after the file name
 pyflyte-metaflow run my_flow.py --alpha 0.5 --label experiment-1
 
 # Register, so it can be launched and scheduled from the UI or API
-pyflyte-metaflow deploy --datastore-root s3://my-bucket/metaflow my_flow.py
+pyflyte-metaflow deploy my_flow.py
 
 # Inspect the generated module without running anything
-pyflyte-metaflow compile --remote --datastore-root s3://my-bucket/metaflow my_flow.py
+pyflyte-metaflow compile --remote my_flow.py
 ```
 
 Useful flags: `-p/--project`, `-d/--domain`, `--follow`, `-i/--image`,
 `--package` (extra pip packages for the task image — your flow's own dependencies),
-`--cpu`/`--memory`, `--max-parallelism`, `-e/--env KEY=VALUE`.
+`--cpu`/`--memory`, `--datastore-root`, `--max-parallelism`, `-e/--env KEY=VALUE`.
 
 ### Programmatic API
 
@@ -78,11 +78,7 @@ import metaflow_flyte2
 
 flyte.init_from_config()
 
-workflow = metaflow_flyte2.load_workflow(
-    "my_flow.py",
-    datastore="s3",
-    datastore_root="s3://my-bucket/metaflow",
-)
+workflow = metaflow_flyte2.load_workflow("my_flow.py", datastore="s3")
 run = flyte.with_runcontext(mode="remote", copy_style="all").run(workflow, alpha=0.5)
 print(run.url)
 ```
@@ -90,26 +86,43 @@ print(run.url)
 Or the one-liners:
 
 ```python
-metaflow_flyte2.run("my_flow.py", remote=True, follow=True,
-                    inputs={"alpha": 0.5},
-                    datastore="s3", datastore_root="s3://my-bucket/metaflow")
+metaflow_flyte2.run("my_flow.py", remote=True, follow=True, inputs={"alpha": 0.5})
 
-metaflow_flyte2.deploy("my_flow.py",
-                       datastore="s3", datastore_root="s3://my-bucket/metaflow")
+metaflow_flyte2.deploy("my_flow.py", datastore="s3")
 ```
 
 `compile_workflow()` returns the generated module path without importing it;
 `environments()` returns the `TaskEnvironment`s for a custom `flyte.deploy` call.
 
-## The datastore requirement
+## The datastore
 
-**Remote runs need `--datastore-root`.** Metaflow steps hand artifacts to each other
-through the *datastore*, not through Flyte's task I/O. On a cluster every step is its own
-pod, so a `local` datastore leaves step 2 unable to see anything step 1 wrote. Point
-`--datastore-root` at an S3 prefix the task role can write to and all steps share it.
+Metaflow steps hand artifacts to each other through the *datastore*, not through Flyte's
+task I/O. On a cluster every step is its own pod, so they need one datastore they all
+share — a `local` one would leave step 2 unable to see anything step 1 wrote.
 
-Local runs need nothing — the default `local` datastore is fine when every step is a
-subprocess on one machine.
+**You don't have to configure this.** Remote runs default to Flyte's own object store,
+resolved at task runtime, landing under:
+
+```
+<flyte-object-store>/metaflow-datastore/<project>/<domain>/<FlowName>/<run-id>/...
+```
+
+Local runs need nothing either — the default `local` datastore is fine when every step is
+a subprocess on one machine.
+
+To keep artifacts somewhere specific, pass `--datastore-root s3://my-bucket/metaflow`.
+
+> [!IMPORTANT]
+> A custom `--datastore-root` must be writable by the **Flyte task role**, not by your
+> local credentials. Your laptop can create and write a bucket that the task pods cannot
+> touch — they run as a different IAM principal, often in a different account, and no
+> client-side check can detect this because the two identities differ.
+>
+> If a step fails with `S3 access denied`, check from the pod's perspective: `403` means
+> the bucket exists but the task role is denied, `404` means it does not exist. On a
+> managed tenant the role's IAM policy is typically scoped to the tenant's own buckets, in
+> which case a bucket policy on your side cannot grant access and the default is the right
+> choice.
 
 ## How it works
 
@@ -117,25 +130,33 @@ Chaining the two libraries naively fails. Each of these is a real failure observ
 a live Flyte 2 tenant, and each is fixed in [`_transform.py`](src/metaflow_flyte2/_transform.py)
 or [`_patch.py`](src/metaflow_flyte2/_patch.py):
 
-1. **Entity names.** metaflow-flyte generates module-private task functions
+1. **Datastore root.** Metaflow needs one object-store prefix shared by every step's pod.
+   The client cannot discover the tenant's store — the platform assigns it per-run, and
+   the SDK's client-side default is a local `/tmp` path — but a *task* can, via
+   `flyte.ctx().raw_data_path`. So `_run_cmd`, the single point where every Metaflow
+   subprocess environment is built, defaults it in-task. Only the *bucket* is taken from
+   the raw data path; the rest is per-action and would leave each step writing where the
+   next cannot read.
+
+2. **Entity names.** metaflow-flyte generates module-private task functions
    (`_step_start`). flyte-migrate names environments `f"{module}_{fn.__name__}_env"`, so a
    leading underscore yields `my_flow__step_start_env` — a double underscore, which Flyte 2
    rejects outright. The generated functions are renamed in the source (AST decides *which*
    names, a token pass does the substitution, so strings and comments are untouched).
 
-2. **Signal handlers off the main thread.** The generated `_run_cmd` forwards SIGTERM to
+3. **Signal handlers off the main thread.** The generated `_run_cmd` forwards SIGTERM to
    the step subprocess via `signal.signal`, which assumes Flyte 1's process-per-task model.
    Flyte 2 runs task functions on a worker thread, where CPython raises
    `ValueError: signal only works in main thread`. A `signal` proxy is injected that installs
    the handler when the task does hold the main thread and skips it otherwise.
 
-3. **Run identity.** The Metaflow run id is derived from
+4. **Run identity.** The Metaflow run id is derived from
    `flytekit.current_context().execution_id.name`, which reads `local` inside a v2 task
    container — every remote run would be `flyte-local-<random>`. The real execution name is
    in the environment, so it is seeded into `METAFLOW_FLYTE_LOCAL_RUN_ID`, restoring the
    intended `flyte-<execution>` linkage.
 
-4. **Settings lost to re-serialization.** This one is subtle. The parent workflow container
+5. **Settings lost to re-serialization.** This one is subtle. The parent workflow container
    re-imports the generated module and rebuilds its children's task templates *from
    scratch*, discarding anything attached to the environment objects client-side. Setting
    env vars or resources on the `TaskEnvironment` therefore looks correct locally and
@@ -144,18 +165,18 @@ or [`_patch.py`](src/metaflow_flyte2/_patch.py):
    resources are baked into the generated **source**, through the v1 `@task(environment=,
    requests=, limits=)` arguments that flyte-migrate already understands.
 
-5. **Resource defaults.** A Metaflow step task runs *two* Python processes — the Flyte task
+6. **Resource defaults.** A Metaflow step task runs *two* Python processes — the Flyte task
    runtime and the Metaflow subprocess it spawns — so the cluster's bare default is easily
    too small (a join over a wide foreach OOMKills). The default is 1 CPU / 4 GiB, matching
    what Metaflow's own `@batch`/`@kubernetes` backends give you. A step with its own
    `@resources` always wins.
 
-6. **Images.** The task image needs `metaflow` and `metaflow-flyte` (the generated command
+7. **Images.** The task image needs `metaflow` and `metaflow-flyte` (the generated command
    line passes `--with=flyte_internal`, a decorator from that package), plus `boto3` for the
    S3 datastore. These are layered onto the images flyte-migrate builds. Add your flow's own
    dependencies with `--package`.
 
-7. **Bundle integrity.** The Metaflow flow file is *executed as a subprocess*, not imported,
+8. **Bundle integrity.** The Metaflow flow file is *executed as a subprocess*, not imported,
    so Flyte's module-based bundling cannot discover it; remote runs use `copy_style="all"`.
    Since Flyte honours `.gitignore`/`.flyteignore`, an ignore rule covering the flow file or
    the generated module would break the run in the cluster — so both are checked before
@@ -211,8 +232,8 @@ Also verified end to end:
 ## Tests
 
 ```bash
-pytest                                                            # unit + integration
-pytest -m remote --datastore-root s3://my-bucket/metaflow         # against a live cluster
+pytest                       # unit + integration, no cluster needed
+pytest -m remote             # against a live cluster (uses the default datastore)
 ```
 
 ## Examples

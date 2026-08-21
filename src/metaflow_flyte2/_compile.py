@@ -18,7 +18,12 @@ import sys
 from collections.abc import Sequence
 from pathlib import Path
 
+from metaflow_flyte2._runtime import SYSROOT_VARS
 from metaflow_flyte2._transform import transform
+
+#: Stand-in for the datastore root while running Metaflow's code generator. Never
+#: appears in the generated module — see the comment in :func:`compile_flow`.
+_COMPILE_TIME_PLACEHOLDER = "s3://metaflow-flyte2-resolved-at-runtime"
 
 
 class CompileError(RuntimeError):
@@ -115,12 +120,11 @@ def compile_flow(
     cmd += list(extra_args)
 
     env = dict(os.environ)
-    if datastore == "s3":
-        if not datastore_root:
-            raise CompileError("datastore='s3' requires datastore_root (e.g. s3://bucket/prefix)")
-        # The generator only records the datastore type; the root is read from the
-        # environment both here and, via the injected task env vars, at run time.
-        env["METAFLOW_DATASTORE_SYSROOT_S3"] = datastore_root
+    if datastore != "local":
+        # Metaflow's CLI refuses to start without this set, but the generator only
+        # ever bakes the datastore *type* — the value never reaches the output, so
+        # a placeholder is safe when the root is resolved at task runtime instead.
+        env[SYSROOT_VARS[datastore]] = datastore_root or _COMPILE_TIME_PLACEHOLDER
 
     result = subprocess.run(
         cmd,

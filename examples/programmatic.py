@@ -4,8 +4,7 @@
 task and can use the v2 API directly::
 
     python programmatic.py            # local
-    METAFLOW_DATASTORE_SYSROOT_S3=s3://my-bucket/metaflow \
-        python programmatic.py --remote   # on the cluster
+    python programmatic.py --remote   # on the cluster
 """
 
 import os
@@ -18,8 +17,10 @@ import metaflow_flyte2
 
 HERE = Path(__file__).parent
 
-# Remote runs need a datastore every step's pod can reach. Point this at an S3
-# prefix your Flyte task role can write to.
+# Optional. Left unset, the flow uses Flyte's own object store, which the task
+# role can always write to. Set it only to keep artifacts somewhere specific —
+# and note it must be writable by the *Flyte task role*, not by your local
+# credentials.
 DATASTORE_ROOT = os.environ.get("METAFLOW_DATASTORE_SYSROOT_S3")
 
 
@@ -27,11 +28,6 @@ def main(remote: bool) -> None:
     flyte.init_from_config(root_dir=HERE)
 
     if remote:
-        if not DATASTORE_ROOT:
-            sys.exit(
-                "Set METAFLOW_DATASTORE_SYSROOT_S3 to an S3 prefix your Flyte task role "
-                "can write to, e.g. s3://my-bucket/metaflow"
-            )
         # Every step is its own pod, so they need a shared Metaflow datastore.
         workflow = metaflow_flyte2.load_workflow(
             HERE / "showcase_flow.py",

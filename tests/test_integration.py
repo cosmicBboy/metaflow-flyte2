@@ -83,12 +83,34 @@ def test_local_datastore_needs_no_root(workdir):
     assert "DATASTORE_TYPE: str = 'local'" in generated.read_text()
 
 
-def test_s3_without_a_root_is_rejected(workdir):
-    from metaflow_flyte2 import CompileError
+def test_s3_without_a_root_defers_to_runtime(workdir):
+    """No root means the module derives one from Flyte's object store in-task.
+
+    The compile-time placeholder must not survive into the output, and the
+    generated module must not pin a SYSROOT of its own — otherwise the runtime
+    resolution would be skipped as "already configured".
+    """
+    from metaflow_flyte2._compile import _COMPILE_TIME_PLACEHOLDER
     from metaflow_flyte2.api import compile_workflow
 
-    with pytest.raises((CompileError, ValueError), match="datastore_root"):
-        compile_workflow(workdir / "linear_flow.py", datastore="s3")
+    generated, _root, _cfg = compile_workflow(workdir / "linear_flow.py", datastore="s3")
+    source = generated.read_text()
+
+    assert _COMPILE_TIME_PLACEHOLDER not in source
+    assert "METAFLOW_DATASTORE_SYSROOT_S3" not in source.split("_MF2_ENVIRONMENT = ")[1].split("\n")[0]
+    assert "_mf2_ensure_datastore_root(env)" in source
+    assert "DATASTORE_TYPE: str = 's3'" in source
+
+
+def test_explicit_root_wins_over_runtime_resolution(workdir):
+    from metaflow_flyte2.api import compile_workflow
+
+    generated, _root, _cfg = compile_workflow(
+        workdir / "linear_flow.py", datastore="s3", datastore_root="s3://explicit/root"
+    )
+    source = generated.read_text()
+    # Present in the baked environment, so the in-task helper sees it already set.
+    assert "'METAFLOW_DATASTORE_SYSROOT_S3': 's3://explicit/root'" in source
 
 
 def test_flow_outside_the_bundle_root_is_rejected(workdir, tmp_path):
@@ -155,6 +177,11 @@ def test_runs_locally_on_flyte2(workdir, flow):
 
 @pytest.mark.remote
 def test_runs_on_a_live_cluster(workdir, datastore_root):
+    """Fan-out and join across real pods, exchanging artifacts via the datastore.
+
+    With no ``--datastore-root`` this also covers the in-task derivation of the
+    default root, which is the path most users take.
+    """
     import flyte
 
     import metaflow_flyte2

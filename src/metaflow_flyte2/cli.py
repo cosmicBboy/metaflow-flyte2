@@ -112,7 +112,11 @@ def _compile_options(fn):
                 type=str,
                 default=None,
                 envvar="METAFLOW_DATASTORE_SYSROOT_S3",
-                help="Shared Metaflow datastore root, e.g. s3://bucket/metaflow. Required for --remote.",
+                help=(
+                    "Shared Metaflow datastore root, e.g. s3://bucket/metaflow. Optional: defaults to "
+                    "Flyte's own object store. Must be writable by the Flyte task role, not by your "
+                    "local credentials."
+                ),
             ),
             click.option("-i", "--image", type=str, default=None, help="Container image URI for the step tasks."),
             click.option(
@@ -164,11 +168,6 @@ def _load_kwargs(
     with_decorators: tuple[str, ...],
 ) -> dict[str, Any]:
     resolved_datastore = datastore or ("s3" if remote else "local")
-    if resolved_datastore == "s3" and not datastore_root:
-        raise click.UsageError(
-            "--datastore-root is required for an s3 datastore (e.g. --datastore-root s3://bucket/metaflow).\n"
-            "Every Metaflow step runs in its own pod, so they need a shared datastore to exchange artifacts."
-        )
     if remote and resolved_datastore == "local":
         click.echo(
             "Warning: --datastore local with --remote gives each step its own empty datastore; "
