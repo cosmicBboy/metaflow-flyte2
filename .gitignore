@@ -1,0 +1,15 @@
+# Metaflow's local datastore and metadata — must never reach the code bundle.
+.metaflow/
+
+# NOTE: the generated *_flyte2.py modules are deliberately NOT ignored. They are
+# regenerated on every run, but they must reach the cluster in the code bundle —
+# Flyte honours .gitignore when packaging, so ignoring them breaks remote runs.
+
+__pycache__/
+*.py[cod]
+.venv/
+build/
+dist/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/

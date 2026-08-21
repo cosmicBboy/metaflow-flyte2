@@ -1,0 +1,53 @@
+[project]
+name = "metaflow-flyte2"
+version = "0.1.0"
+description = "Run Metaflow flows on Flyte 2, by composing metaflow-flyte with flyte-migrate"
+readme = "README.md"
+license = { text = "Apache-2.0" }
+requires-python = ">=3.10"
+keywords = ["metaflow", "flyte", "workflow", "orchestration", "migration"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "metaflow>=2.9",
+    "metaflow-flyte>=0.4.3",
+    "flyte-migrate>=0.0.3",
+    "flyte>=2.5.20",
+    "flytekit",
+    "rich-click",
+]
+
+[project.scripts]
+pyflyte-metaflow = "metaflow_flyte2.cli:main"
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0", "ruff>=0.4"]
+
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["metaflow_flyte2*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "remote: requires a live Flyte 2 cluster (opt in with -m remote)",
+]
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "W", "B", "C4"]
+ignore = ["E501"]
