@@ -204,9 +204,10 @@ def load_workflow(
     ``flyte.deploy``, or ``flyte.with_runcontext(...).run``. See
     :func:`compile_workflow` for the compile-time options.
 
-    ``datastore="s3"`` with a ``datastore_root`` is required for remote runs —
-    every Metaflow step executes in its own pod, and a ``local`` datastore would
-    leave each one unable to read the previous step's artifacts.
+    Remote runs need ``datastore="s3"`` — every Metaflow step executes in its own
+    pod, and a ``local`` datastore would leave each unable to read the previous
+    step's artifacts. ``datastore_root`` is optional; left unset, the generated
+    module points Metaflow at Flyte's own object store at task runtime.
 
     ``remote_ready`` gates the checks that only matter when the code is shipped to
     a cluster; :func:`run` clears it for local runs, where nothing is bundled.
@@ -313,6 +314,10 @@ def run(
     """
     import flyte
 
+    # Remote runs put every step in its own pod, so a local datastore cannot be
+    # the default there; the root itself is resolved at task runtime when unset.
+    if remote:
+        kwargs.setdefault("datastore", "s3")
     wf = load_workflow(flow_file, remote_ready=remote, **kwargs)
     mode = "remote" if remote else "local"
     style = copy_style or (_REMOTE_COPY_STYLE if remote else "loaded_modules")

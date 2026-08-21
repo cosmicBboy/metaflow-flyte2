@@ -17,7 +17,13 @@ source means those imports need nothing installed beyond published packages.
 
 2. **Thread affinity and run identity.** See :data:`_PRELUDE`.
 
-3. **Container environment and default resources.** The Metaflow step subprocess
+3. **Datastore root.** Metaflow steps exchange artifacts through a datastore
+   that every pod must share. Rather than making the user supply one, ``_run_cmd``
+   is taught to default it to Flyte's own object store, read from
+   ``flyte.ctx().raw_data_path`` at task runtime — see
+   :func:`inject_datastore_resolution`.
+
+4. **Container environment and default resources.** The Metaflow step subprocess
    needs to know where the flow file is and which datastore to use, and it needs
    enough memory for two Python processes. Both are injected through the v1
    ``@task`` arguments the generator already funnels through ``_TASK_KWARGS``
@@ -87,6 +93,44 @@ class _Mf2MainThreadOnlySignal:
 
 
 signal = _Mf2MainThreadOnlySignal()
+
+
+# Metaflow's env var for each datastore backend it can share across pods.
+_MF2_SYSROOT_VARS = {
+    's3': 'METAFLOW_DATASTORE_SYSROOT_S3',
+    'gs': 'METAFLOW_DATASTORE_SYSROOT_GS',
+    'azure': 'METAFLOW_DATASTORE_SYSROOT_AZURE',
+}
+
+
+def _mf2_ensure_datastore_root(env):
+    """Default Metaflow's datastore to Flyte's own object store.
+
+    Only the *bucket* is taken from the raw data path — that part is identical
+    for every action in every run, which is what the datastore needs. The rest of
+    the raw data path is per-action and would leave each step writing somewhere
+    the next one cannot find.
+    """
+    var = _MF2_SYSROOT_VARS.get(DATASTORE_TYPE)
+    if not var or env.get(var):
+        return  # local datastore, or an explicit root was configured
+    try:
+        import flyte
+
+        raw = str(flyte.ctx().raw_data_path.path)
+    except Exception:
+        return
+    scheme, _, remainder = raw.partition('://')
+    bucket = remainder.split('/', 1)[0]
+    if not remainder or not bucket:
+        return  # a local raw data path: nothing to derive a shared root from
+    env[var] = '{}://{}/metaflow-datastore/{}/{}'.format(
+        scheme,
+        bucket,
+        env.get('FLYTE_INTERNAL_PROJECT', 'default'),
+        env.get('FLYTE_INTERNAL_DOMAIN', 'default'),
+    )
+
 
 if not os.environ.get('METAFLOW_FLYTE_LOCAL_RUN_ID'):
     _mf2_execution = os.environ.get('FLYTE_INTERNAL_EXECUTION_ID')
@@ -205,6 +249,36 @@ def inject_prelude(source: str) -> str:
     return _insert_after_line(source, last_import_line, _PRELUDE)
 
 
+#: The two lines metaflow-flyte emits at the top of ``_run_cmd``.
+_RUN_CMD_ANCHOR = """\
+    env = os.environ.copy()
+    env.setdefault('METAFLOW_DATASTORE_SYSROOT_LOCAL', os.path.expanduser('~'))
+"""
+
+#: The exact line inserted into ``_run_cmd``. Used as the idempotency marker —
+#: matching on the bare call would also match the prelude's *definition* of the
+#: same function, so the injection would silently never happen.
+_RUN_CMD_CALL = "    _mf2_ensure_datastore_root(env)  # injected by metaflow_flyte2\n"
+
+
+def inject_datastore_resolution(source: str) -> str:
+    """Resolve the datastore root inside the task, when none was configured.
+
+    ``_run_cmd`` is the one place every Metaflow subprocess environment is built
+    — both the ``init`` command and each ``step`` — so hooking it covers all of
+    them. It has to happen here rather than at compile time for two reasons: the
+    client cannot discover the tenant's object store (the platform assigns it
+    per-run, and the SDK's client-side default is a local ``/tmp`` path), and the
+    value is only knowable from inside a task, where ``flyte.ctx()`` exists.
+
+    Skipped silently if the generator's ``_run_cmd`` no longer matches; an
+    explicit ``--datastore-root`` still works in that case.
+    """
+    if _RUN_CMD_CALL in source or _RUN_CMD_ANCHOR not in source:
+        return source
+    return source.replace(_RUN_CMD_ANCHOR, _RUN_CMD_ANCHOR + _RUN_CMD_CALL, 1)
+
+
 def inject_task_defaults(
     source: str,
     env_vars: dict[str, str],
@@ -314,6 +388,7 @@ def transform(
     rewritten = apply_renames(source, plan_renames(source))
     rewritten = inject_prelude(rewritten)
     rewritten = inject_task_defaults(rewritten, env_vars or {}, cpu, memory)
+    rewritten = inject_datastore_resolution(rewritten)
     rewritten = fix_condition_branch(rewritten)
     if rewritten == source:
         return source

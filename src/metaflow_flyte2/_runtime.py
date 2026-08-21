@@ -16,7 +16,8 @@ sets up on its own, because neither knows the other exists:
 2. Metaflow steps hand artifacts to each other through the *datastore*, not
    through Flyte's I/O. Each step is a separate pod, so a ``local`` datastore
    leaves step N unable to read step N-1's artifacts. Remote runs therefore need
-   a shared datastore root — an S3 prefix the task role can write to.
+   a shared datastore root, which defaults to Flyte's own object store — the one
+   bucket the task role is guaranteed to be able to write to.
 3. ``metaflow`` itself must be importable by the subprocess interpreter, so it
    has to be a pip package in the task image.
 
@@ -28,6 +29,13 @@ from __future__ import annotations
 
 import dataclasses
 import os
+
+#: Metaflow's environment variable for each shared-datastore backend.
+SYSROOT_VARS = {
+    "s3": "METAFLOW_DATASTORE_SYSROOT_S3",
+    "gs": "METAFLOW_DATASTORE_SYSROOT_GS",
+    "azure": "METAFLOW_DATASTORE_SYSROOT_AZURE",
+}
 
 #: Packages every task image needs for the step subprocess to start at all.
 #: ``metaflow-flyte`` is required because the generated command line passes
@@ -52,8 +60,11 @@ class RuntimeConfig:
     #: Metaflow datastore type used by the step subprocesses ("local" or "s3").
     datastore: str = "local"
 
-    #: Root of the shared datastore, e.g. ``s3://bucket/metaflow``. Required
-    #: when ``datastore`` is ``"s3"``.
+    #: Root of the shared datastore, e.g. ``s3://bucket/metaflow``. Optional:
+    #: when unset, the generated module derives one from Flyte's own object
+    #: store at task runtime (see
+    #: :func:`metaflow_flyte2._transform.inject_datastore_resolution`), so the
+    #: datastore lands somewhere the task role can already write.
     datastore_root: str | None = None
 
     #: Extra pip packages layered onto every task image — the flow's own
@@ -82,11 +93,12 @@ class RuntimeConfig:
         env: dict[str, str] = {}
         if self.flow_file_in_container:
             env["METAFLOW_FLYTE_FLOW_FILE"] = self.flow_file_in_container
-        if self.datastore == "s3":
-            if not self.datastore_root:
-                raise ValueError("datastore='s3' requires datastore_root (e.g. s3://bucket/prefix)")
-            env["METAFLOW_DEFAULT_DATASTORE"] = "s3"
-            env["METAFLOW_DATASTORE_SYSROOT_S3"] = self.datastore_root
+        if self.datastore != "local":
+            env["METAFLOW_DEFAULT_DATASTORE"] = self.datastore
+            if self.datastore_root:
+                # Left unset on purpose otherwise: the generated module fills it
+                # in from Flyte's object store once it is running in a task.
+                env[SYSROOT_VARS[self.datastore]] = self.datastore_root
         # Metaflow refuses to run without a user; container images have no
         # passwd entry for the runtime UID, so set it explicitly.
         env["METAFLOW_USER"] = self.username or os.environ.get("USER", "flyte")
